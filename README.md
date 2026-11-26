@@ -71,8 +71,9 @@ include/            headers
   cg.hpp            the CG solver
 src/                implementations + main.cpp
 bench/
-  run_bench.sh      benchmark script (ranks × threads sweep)
-  results.csv       raw benchmark results
+  run_bench.sh      benchmark script (ranks × threads sweep, problem-size sweep)
+  results.csv       raw results of the ranks × threads sweep
+  sizes.csv         raw results of the problem-size sweep
 ```
 
 ## Build
@@ -102,40 +103,68 @@ time       = 3.05 s
 
 ## Results
 
-Setup: `n = 1000` (10⁶ unknowns), `tol = 1e-8`, Release build, Open MPI, on a single Apple Silicon laptop. Each configuration was run 5 times (the `1 × 8` configuration 3 times) and the median is reported. Raw data: [`bench/results.csv`](bench/results.csv).
+Setup: Apple M4 laptop (10 cores: 4 performance + 6 efficiency), Open MPI, Release build, `tol = 1e-8`. Each configuration was run 5 times and the median is reported. Raw data: [`bench/results.csv`](bench/results.csv) and [`bench/sizes.csv`](bench/sizes.csv).
 
-| ranks × threads | cores | median time (s) | speedup vs 1×1 |
-|---|---|---|---|
-| 1 × 1 | 1 | 6.89 | 1.00× |
-| 2 × 1 | 2 | 4.11 | 1.68× |
-| 1 × 2 | 2 | 4.15 | 1.66× |
-| 4 × 1 | 4 | 3.67 | 1.88× |
-| 2 × 2 | 4 | 3.65 | 1.89× |
-| 1 × 4 | 4 | 3.95 | 1.74× |
-| 8 × 1 | 8 | 3.71 | 1.86× |
-| 4 × 2 | 8 | 3.16 | 2.18× |
-| 2 × 4 | 8 | **3.06** | **2.25×** |
-| 1 × 8 | 8 | 3.33 | 2.07× |
+To reproduce:
 
-Every configuration converged in exactly **1715 iterations** with a maximum error of about 2.25 · 10⁻⁷, so the parallel versions compute the same thing as the serial one.
+```bash
+./bench/run_bench.sh 1000 5              # all ranks × threads configurations, 5 runs each
+./bench/run_bench.sh --sizes 3           # problem-size sweep with 2 ranks × 4 threads
+CONFIGS="1x8" ./bench/run_bench.sh       # re-run only some configurations (others are kept)
+./bench/run_bench.sh --summary           # print the table from results.csv without running
+```
+
+### Ranks × threads (n = 1000, 10⁶ unknowns)
+
+| ranks × threads | cores | median time (s) | speedup | ms / iteration | est. bandwidth (GB/s) |
+|---|---|---|---|---|---|
+| 1 × 1 | 1 | 6.68 | 1.00× | 3.89 | 49 |
+| 2 × 1 | 2 | 4.11 | 1.62× | 2.40 | 79 |
+| 1 × 2 | 2 | 4.18 | 1.60× | 2.44 | 78 |
+| 4 × 1 | 4 | 3.31 | 2.01× | 1.93 | 98 |
+| 2 × 2 | 4 | 3.29 | 2.03× | 1.92 | 99 |
+| 1 × 4 | 4 | 3.31 | 2.02× | 1.93 | 98 |
+| 8 × 1 | 8 | 3.22 | 2.07× | 1.88 | 101 |
+| 4 × 2 | 8 | 3.12 | 2.14× | 1.82 | 104 |
+| 2 × 4 | 8 | **3.05** | **2.19×** | **1.78** | **107** |
+| 1 × 8 | 8 | 3.20 | 2.08× | 1.87 | 102 |
+
+Every run converged in exactly **1715 iterations** with a maximum error of about 2.25 · 10⁻⁷, so all parallel versions compute the same thing as the serial one. Run-to-run variation was small (typically under 2%).
+
+The bandwidth column is an estimate: about 190 bytes of memory traffic per unknown per iteration (see below), divided by the measured time per iteration.
 
 ### Analysis: CG is memory-bound
 
-The speedup stops at about 2× even with 8 cores. The reason is **memory bandwidth**, not communication:
+The speedup reaches 2× at 4 cores and then almost stops. The reason is **memory bandwidth**, not communication:
 
 - The halo exchange moves only 2 × 1000 doubles (16 KB) per iteration, which is negligible.
-- One CG iteration streams roughly **190 MB** through memory: the CSR arrays (`values` 40 MB, `col_idx` 20 MB, `row_ptr` 4 MB), plus about ten passes over 8 MB vectors (SpMV input/output, two dot products, two axpys, the `p` update and the halo copy).
-- At 4.0 ms per iteration (1 × 1), that is about **47 GB/s** from a single core. At 1.8 ms per iteration (2 × 4), about **105 GB/s**, which is close to the laptop's total memory bandwidth.
+- One CG iteration streams roughly **190 MB** through memory at n = 1000: the CSR arrays (`values` 40 MB, `col_idx` 20 MB, `row_ptr` 4 MB), plus about ten passes over 8 MB vectors (SpMV input/output, two dot products, two axpys, the `p` update and the halo copy).
+- A single core reaches about **49 GB/s**. With 4 cores the estimate is already about **98 GB/s**, and the best configuration reaches about **107 GB/s**, close to the M4's quoted memory bandwidth of 120 GB/s.
 
-SpMV does about 2 floating-point operations per 12 bytes loaded, so its arithmetic intensity is very low (~0.17 flop/byte). In roofline terms, it sits far on the memory-bound side: once the cores together saturate the memory bus, adding more cores (ranks or threads) cannot make it faster.
+SpMV does about 2 floating-point operations per 12 bytes loaded, an arithmetic intensity of roughly 0.17 flop/byte. In roofline terms it sits far on the memory-bound side: once the cores together saturate the memory bus, more cores (ranks or threads) cannot make it faster.
 
-This also explains why **the split between ranks and threads matters little here**: on one machine, ranks and threads share the same memory system, so they hit the same limit. The hybrid configurations (`2 × 4`, `4 × 2`) are slightly faster than pure MPI (`8 × 1`), which has more halo copies and more participants in each `Allreduce`, and slightly faster than pure OpenMP (`1 × 8`).
+This explains the results:
 
-On a real cluster, the picture changes: each node brings its own memory bandwidth, so adding nodes scales the bandwidth, and the hybrid model (one or a few ranks per node or socket, threads inside) reduces the number of MPI messages and the cost of the global reductions.
+- **At 4 cores, the split does not matter**: 4 × 1, 2 × 2 and 1 × 4 all take 3.3 s. Ranks and threads share the same memory system and hit the same limit.
+- **Going from 4 to 8 cores adds only ~8%.** The M4 has only 4 performance cores, so the extra 4 are efficiency cores, and the memory bus is already nearly saturated.
+- **The hybrid split is slightly best** at 8 cores (2 × 4 at 3.05 s vs 3.22 s for pure MPI and 3.20 s for pure OpenMP). Pure MPI does more halo copies and has more participants in each `Allreduce`; pure OpenMP has a larger fork/join and reduction cost per loop.
 
-### Convergence
+On a real cluster, the picture changes: each node brings its own memory bandwidth, so adding nodes scales the total bandwidth, and the hybrid model (one or a few ranks per node or socket, threads inside) reduces the number of MPI messages and the cost of the global reductions.
 
-The number of iterations grows linearly with the grid size: 183 for `n = 100`, 873 for `n = 500`, 1715 for `n = 1000`. This matches theory: CG needs O(√κ) iterations, and the condition number κ of the Poisson matrix grows like n².
+### Problem size (2 ranks × 4 threads)
+
+| n | unknowns | iterations | median time (s) | ms / iteration | est. bandwidth (GB/s) |
+|---|---|---|---|---|---|
+| 250 | 62,500 | 444 | 0.077 | 0.17 | 68 |
+| 500 | 250,000 | 873 | 0.321 | 0.37 | 129 |
+| 1000 | 1,000,000 | 1715 | 2.97 | 1.73 | 110 |
+| 2000 | 4,000,000 | 3361 | 26.9 | 8.00 | 95 |
+
+- **Iterations grow linearly with n** (444 → 873 → 1715 → 3361, roughly doubling each time). This matches theory: CG needs O(√κ) iterations, and the condition number κ of the Poisson matrix grows like n².
+- **Total time grows like n³**: doubling n gives 4× more unknowns and 2× more iterations, so about 8× more time (measured: 9.3× from 500 to 1000, 9.0× from 1000 to 2000).
+- **n = 500 appears faster than memory** (129 GB/s, above the 120 GB/s peak). Its working set (~48 MB) is small enough that part of it is served from the caches.
+- **n = 250 is slower per byte** (68 GB/s). Each iteration takes only 0.17 ms, so the fixed costs per iteration (three synchronisation points, OpenMP fork/join for each loop, MPI latency) become a large share of the time.
+- **n = 2000 drops to 95 GB/s**: the working set (~760 MB) is far larger than any cache, so everything comes from main memory.
 
 ## Limitations and possible extensions
 

@@ -43,7 +43,9 @@ int main(int argc, char* argv[]) {
     std::vector<double> x;
     MPI_Barrier(MPI_COMM_WORLD);                 // everyone starts together
     double t0 = MPI_Wtime();
-    int iters = cg(A, part, b, x, 2000, 1e-8);
+    // CG needs O(n) iterations for this problem: leave enough headroom for large grids.
+    const int max_iter = std::max(2000, 4 * n);
+    int iters = cg(A, part, b, x, max_iter, 1e-8);
     double t1 = MPI_Wtime();
 
     // 4. max error: local max, then global max over all ranks
